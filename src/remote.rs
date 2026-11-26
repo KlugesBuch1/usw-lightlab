@@ -1,7 +1,7 @@
 use std::path::Path;
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use eframe::egui;
 use russh::client::Handle;
@@ -26,7 +26,10 @@ case $pid in
 esac
 alive=0
 marker=0
+attached=0
 script=
+cmd=
+uptime=0
 if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
     alive=1
     cmd=$(tr '\0' ' ' < "/proc/$pid/cmdline" 2>/dev/null)
@@ -36,14 +39,46 @@ if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
     if [ "$marker" = 1 ]; then
         script=$(printf '%s\n' "$cmd" | awk '{for (i = 1; i <= NF; i++) if ($i ~ /lightlab-run\.sh$/) {print $(i + 1); exit}}')
         script=${script##*/}
+        case $cmd in
+            *" attached "*) attached=1 ;;
+        esac
+        hz=$(getconf CLK_TCK 2>/dev/null || echo 100)
+        starttime=$(awk '{print $22}' "/proc/$pid/stat" 2>/dev/null)
+        now=$(awk '{print $1}' /proc/uptime 2>/dev/null)
+        uptime=$(awk -v n="$now" -v s="$starttime" -v h="$hz" 'BEGIN { if (h < 1) h = 100; u = n - s / h; if (u < 0) u = 0; printf "%d", u }')
     fi
+fi
+size=0
+[ -r /tmp/usw-lightlab.log ] && size=$(wc -c < /tmp/usw-lightlab.log 2>/dev/null | tr -d ' ')
+offset=${offset:-0}
+case $offset in
+    ''|*[!0-9]*) offset=0 ;;
+esac
+trunc=0
+if [ "$offset" -gt "$size" ]; then
+    offset=0
+    trunc=1
+fi
+tail_off=$offset
+tail_data=
+if [ "${no_log:-0}" = 1 ] || [ "$attached" = 1 ]; then
+    tail_off=$size
+elif [ "$offset" -lt "$size" ]; then
+    tail_data=$(tail -c +$((offset + 1)) /tmp/usw-lightlab.log 2>/dev/null | head -c 32768 | base64 | tr -d '\n')
 fi
 printf 'MODE=%s\n' "${mode:-unknown}"
 printf 'PRESENT=%s\n' "$present"
 printf 'PID=%s\n' "$pid"
 printf 'ALIVE=%s\n' "$alive"
 printf 'MARKER=%s\n' "$marker"
+printf 'ATTACHED=%s\n' "$attached"
+printf 'UPTIME=%s\n' "$uptime"
+printf 'SIZE=%s\n' "$size"
+printf 'OFFSET=%s\n' "$tail_off"
+printf 'TRUNC=%s\n' "$trunc"
+printf 'CMD=%s\n' "$(printf '%s' "$cmd" | base64 | tr -d '\n')"
 printf 'SCRIPT=%s\n' "$(printf '%s' "$script" | base64 | tr -d '\n')"
+printf 'LOG=%s\n' "$tail_data"
 "#;
 
 pub struct Remote {
@@ -66,6 +101,10 @@ pub enum RemoteEvent {
         stopped: bool,
         error: Option<String>,
     },
+    RunStarted {
+        script: String,
+    },
+    Status(RunStatus),
     Error(String),
     Log(String),
 }
@@ -81,6 +120,7 @@ enum Command {
     Disconnect,
     StartTest(TestJob),
     StopTest,
+    Keep(TestJob),
 }
 
 #[derive(Clone, Debug, Default)]
@@ -90,7 +130,11 @@ pub struct RunStatus {
     pub pidfile_present: bool,
     pub alive: bool,
     pub marker: bool,
+    pub attached: bool,
     pub script: String,
+    pub cmdline: String,
+    pub uptime_secs: u64,
+    pub log_size: u64,
 }
 
 impl RunStatus {
@@ -102,9 +146,14 @@ impl RunStatus {
         let mode = self.led_mode.as_deref().unwrap_or("unknown");
         if self.is_running() {
             format!(
-                "led_mode={mode}, pidfile PID {} running {}",
+                "led_mode={mode}, pidfile PID {} running {}{}",
                 self.pidfile.unwrap_or_default(),
-                self.script
+                self.script,
+                if self.attached {
+                    " (attached test)"
+                } else {
+                    ""
+                }
             )
         } else if self.pidfile_present {
             format!(
@@ -117,6 +166,13 @@ impl RunStatus {
             format!("led_mode={mode}, pidfile absent")
         }
     }
+}
+
+struct StatusReport {
+    status: RunStatus,
+    log: String,
+    next_offset: u64,
+    truncated: bool,
 }
 
 #[derive(Clone)]
@@ -183,6 +239,12 @@ impl Remote {
             .map_err(|_| "the SSH worker is not running".to_string())
     }
 
+    pub fn keep(&self, job: TestJob) -> Result<(), String> {
+        self.commands
+            .send(Command::Keep(job))
+            .map_err(|_| "the SSH worker is not running".to_string())
+    }
+
     pub fn poll(&self) -> Vec<RemoteEvent> {
         self.events.try_iter().collect()
     }
@@ -191,16 +253,30 @@ impl Remote {
 async fn run(mut commands: tokio_mpsc::UnboundedReceiver<Command>, sink: Sink) {
     let mut session: Option<Handle<Handler>> = None;
     let mut active_stop: Option<oneshot::Sender<()>> = None;
-    let mut tick = tokio::time::interval(Duration::from_secs(1));
+    let mut log_offset = 0u64;
+    let mut last_poll_error: Option<String> = None;
+    let mut tick = tokio::time::interval(Duration::from_millis(1500));
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
         tokio::select! {
             command = commands.recv() => {
                 let Some(command) = command else { break };
                 match command {
-                    Command::Connect(settings) => connect(settings, &mut session, &sink).await,
+                    Command::Connect(settings) => {
+                        connect(settings, &mut session, &sink).await;
+                        if let Some(handle) = session.as_ref() {
+                            log_offset = 0;
+                            last_poll_error = None;
+                            if let Err(error) = poll_status(handle, &mut log_offset, &sink).await {
+                                sink.emit(RemoteEvent::Log(format!("status poll failed: {error}")));
+                                last_poll_error = Some(error);
+                            }
+                        }
+                    }
                     Command::Disconnect => {
                         active_stop = None;
+                        log_offset = 0;
+                        last_poll_error = None;
                         if let Some(handle) = session.take() {
                             let _ = handle.disconnect(Disconnect::ByApplication, "lightlab disconnect", "en").await;
                             sink.emit(RemoteEvent::Log("SSH disconnected".into()));
@@ -208,6 +284,7 @@ async fn run(mut commands: tokio_mpsc::UnboundedReceiver<Command>, sink: Sink) {
                         sink.emit(RemoteEvent::Disconnected(None));
                     }
                     Command::StartTest(job) => {
+                        log_offset = 0;
                         start_test(job, &mut session, &mut active_stop, &sink).await;
                     }
                     Command::StopTest => {
@@ -220,13 +297,29 @@ async fn run(mut commands: tokio_mpsc::UnboundedReceiver<Command>, sink: Sink) {
                             ));
                         }
                     }
+                    Command::Keep(job) => {
+                        keep(job, &mut session, &mut log_offset, &sink).await;
+                        last_poll_error = None;
+                    }
                 }
             }
             _ = tick.tick(), if session.is_some() => {
                 if session.as_ref().is_some_and(|handle| handle.is_closed()) {
                     session = None;
                     active_stop = None;
+                    log_offset = 0;
+                    last_poll_error = None;
                     sink.emit(RemoteEvent::Disconnected(Some("the SSH connection closed".into())));
+                } else if let Some(handle) = session.as_ref() {
+                    match poll_status(handle, &mut log_offset, &sink).await {
+                        Ok(()) => last_poll_error = None,
+                        Err(error) => {
+                            if last_poll_error.as_deref() != Some(error.as_str()) {
+                                sink.emit(RemoteEvent::Log(format!("status poll failed: {error}")));
+                                last_poll_error = Some(error);
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -277,6 +370,134 @@ async fn ensure_connected(
     }
     connect(settings.clone(), session, sink).await;
     session.as_ref().is_some_and(|handle| !handle.is_closed())
+}
+
+async fn keep(
+    job: TestJob,
+    session: &mut Option<Handle<Handler>>,
+    log_offset: &mut u64,
+    sink: &Sink,
+) {
+    if !ensure_connected(&job.settings, session, sink).await {
+        return;
+    }
+    let handle = session.as_ref().unwrap();
+    let status = match read_status(handle).await {
+        Ok(status) => status,
+        Err(error) => {
+            sink.emit(RemoteEvent::Error(format!(
+                "cannot read the switch state before keeping: {error}. No animation was started; led_mode and the pidfile are unknown."
+            )));
+            return;
+        }
+    };
+    if status.is_running() {
+        sink.emit(RemoteEvent::Error(format!(
+            "a run is already live: PID {} with script {}. Stop it before keeping. Nothing changed; {}.",
+            status.pidfile.unwrap_or_default(),
+            status.script,
+            status.summary()
+        )));
+        return;
+    }
+    if status.pidfile_present {
+        if status.alive {
+            sink.emit(RemoteEvent::Log(format!(
+                "pidfile PID {} is alive but is not lightlab-run.sh; the supervisor will unlink it without signalling",
+                status.pidfile.unwrap_or_default()
+            )));
+        } else {
+            sink.emit(RemoteEvent::Log(
+                "the stale pidfile will be removed by the supervisor".into(),
+            ));
+        }
+    }
+
+    let name = match upload_animation(handle, &job.script_name, &job.script).await {
+        Ok(name) => name,
+        Err(error) => {
+            sink.emit(RemoteEvent::Error(format!(
+                "cannot upload the animation: {error}. No animation was started; {}.",
+                status.summary()
+            )));
+            return;
+        }
+    };
+    let animation_path = format!("{REMOTE_DIR}/{name}");
+    let command = format!(
+        "nohup setsid sh {} {} >/tmp/usw-lightlab.log 2>&1 </dev/null &",
+        sh_quote(REMOTE_SUPERVISOR),
+        sh_quote(&animation_path)
+    );
+    *log_offset = 0;
+    let output = match exec(handle, &command, None).await {
+        Ok(output) => output,
+        Err(error) => {
+            let state = state_or_unknown(handle).await;
+            sink.emit(RemoteEvent::Error(format!(
+                "cannot start the kept run: {error}. {state}."
+            )));
+            return;
+        }
+    };
+    if output.code != Some(0) {
+        let state = state_or_unknown(handle).await;
+        sink.emit(RemoteEvent::Error(format!(
+            "cannot start the kept run: {}. {state}.",
+            output.error_text()
+        )));
+        return;
+    }
+
+    let deadline = Instant::now() + Duration::from_secs(4);
+    loop {
+        let current = match read_status(handle).await {
+            Ok(status) => status,
+            Err(_) if Instant::now() < deadline => {
+                tokio::time::sleep(Duration::from_millis(150)).await;
+                continue;
+            }
+            Err(error) => {
+                sink.emit(RemoteEvent::Error(format!(
+                    "the kept run was launched but its state could not be read: {error}. Check /tmp/usw-lightlab.log and the pidfile."
+                )));
+                return;
+            }
+        };
+        if current.is_running() {
+            if current.script != name {
+                sink.emit(RemoteEvent::Error(format!(
+                    "the pidfile was claimed by PID {} with script {} instead of {name}; nothing was started by lightlab. {}.",
+                    current.pidfile.unwrap_or_default(),
+                    current.script,
+                    current.summary()
+                )));
+                return;
+            }
+            match poll_status(handle, log_offset, sink).await {
+                Ok(()) => {}
+                Err(error) => sink.emit(RemoteEvent::Log(format!("status poll failed: {error}"))),
+            }
+            sink.emit(RemoteEvent::RunStarted { script: name });
+            return;
+        }
+        if Instant::now() >= deadline {
+            let report = read_status_report(handle, 0, false).await.ok();
+            if let Some(report) = &report {
+                if !report.log.is_empty() {
+                    sink.emit(RemoteEvent::Log(report.log.clone()));
+                }
+            }
+            let state = report
+                .map(|report| report.status.summary())
+                .unwrap_or_else(|| "switch state unknown".into());
+            sink.emit(RemoteEvent::Error(format!(
+                "no kept run appeared in the pidfile within 4 seconds. {state}. Check /tmp/usw-lightlab.log."
+            )));
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(150)).await;
+    }
 }
 
 async fn start_test(
@@ -431,22 +652,65 @@ fn spawn_test(
 }
 
 async fn read_status(handle: &Handle<Handler>) -> Result<RunStatus, String> {
-    let output = exec(handle, STATUS_SCRIPT, None).await?;
+    read_status_report(handle, 0, true)
+        .await
+        .map(|report| report.status)
+}
+
+async fn read_status_report(
+    handle: &Handle<Handler>,
+    offset: u64,
+    no_log: bool,
+) -> Result<StatusReport, String> {
+    let command = format!(
+        "no_log={}\noffset={offset}\n{STATUS_SCRIPT}",
+        if no_log { 1 } else { 0 }
+    );
+    let output = exec(handle, &command, None).await?;
     if output.code != Some(0) {
         return Err(output.error_text());
     }
-    parse_status(&String::from_utf8_lossy(&output.stdout))
+    parse_status_report(&String::from_utf8_lossy(&output.stdout))
 }
 
-fn parse_status(text: &str) -> Result<RunStatus, String> {
-    use base64::Engine;
+async fn poll_status(
+    handle: &Handle<Handler>,
+    offset: &mut u64,
+    sink: &Sink,
+) -> Result<(), String> {
+    let report = read_status_report(handle, *offset, false).await?;
+    if report.truncated {
+        sink.emit(RemoteEvent::Log(
+            "the run log was truncated; reading it from the start".into(),
+        ));
+    }
+    *offset = report.next_offset;
+    if !report.log.is_empty() {
+        sink.emit(RemoteEvent::Log(report.log));
+    }
+    sink.emit(RemoteEvent::Status(report.status));
+    Ok(())
+}
 
+#[cfg(test)]
+fn parse_status(text: &str) -> Result<RunStatus, String> {
+    parse_status_report(text).map(|report| report.status)
+}
+
+fn parse_status_report(text: &str) -> Result<StatusReport, String> {
     let mut mode = None;
     let mut present = None;
     let mut pid = None;
     let mut alive = None;
     let mut marker = None;
-    let mut script = None;
+    let mut attached = false;
+    let mut script = String::new();
+    let mut cmdline = String::new();
+    let mut uptime = 0;
+    let mut size = 0;
+    let mut offset: u64 = 0;
+    let mut truncated = false;
+    let mut log = String::new();
     for line in text.lines() {
         let Some((key, value)) = line.split_once('=') else {
             continue;
@@ -457,33 +721,47 @@ fn parse_status(text: &str) -> Result<RunStatus, String> {
             "PID" => pid = value.parse::<u32>().ok(),
             "ALIVE" => alive = Some(value == "1"),
             "MARKER" => marker = Some(value == "1"),
-            "SCRIPT" => {
-                script = if value.is_empty() {
-                    Some(String::new())
-                } else {
-                    Some(
-                        String::from_utf8(
-                            base64::engine::general_purpose::STANDARD
-                                .decode(value)
-                                .map_err(|error| {
-                                    format!("cannot decode the switch status: {error}")
-                                })?,
-                        )
-                        .map_err(|error| format!("cannot decode the switch status: {error}"))?,
-                    )
-                };
-            }
+            "ATTACHED" => attached = value == "1",
+            "UPTIME" => uptime = value.parse().unwrap_or(0),
+            "SIZE" => size = value.parse().unwrap_or(0),
+            "OFFSET" => offset = value.parse().unwrap_or(0),
+            "TRUNC" => truncated = value == "1",
+            "CMD" => cmdline = decode_status(value)?,
+            "SCRIPT" => script = decode_status(value)?,
+            "LOG" => log = decode_status(value)?,
             _ => {}
         }
     }
-    Ok(RunStatus {
-        led_mode: mode,
-        pidfile_present: present.ok_or("switch status did not include the pidfile state")?,
-        pidfile: pid,
-        alive: alive.ok_or("switch status did not include the PID state")?,
-        marker: marker.ok_or("switch status did not include the supervisor marker")?,
-        script: script.unwrap_or_default(),
+    let log_len = log.len() as u64;
+    Ok(StatusReport {
+        status: RunStatus {
+            led_mode: mode,
+            pidfile_present: present.ok_or("switch status did not include the pidfile state")?,
+            pidfile: pid,
+            alive: alive.ok_or("switch status did not include the PID state")?,
+            marker: marker.ok_or("switch status did not include the supervisor marker")?,
+            attached,
+            script,
+            cmdline,
+            uptime_secs: uptime,
+            log_size: size,
+        },
+        log,
+        next_offset: offset.saturating_add(log_len),
+        truncated,
     })
+}
+
+fn decode_status(value: &str) -> Result<String, String> {
+    use base64::Engine;
+
+    if value.is_empty() {
+        return Ok(String::new());
+    }
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(value)
+        .map_err(|error| format!("cannot decode the switch status: {error}"))?;
+    String::from_utf8(bytes).map_err(|error| format!("cannot decode the switch status: {error}"))
 }
 
 async fn upload_animation(

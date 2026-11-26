@@ -8,7 +8,7 @@ use eframe::egui::{
 use crate::action::{ActionGate, ActionKind};
 use crate::led::{LedLine, Leds};
 use crate::preview::{Preview, PreviewEvent};
-use crate::remote::{Remote, RemoteEvent, TestJob};
+use crate::remote::{Remote, RemoteEvent, RunStatus, TestJob};
 use crate::settings::{self, AuthMode, Config};
 use crate::ssh::{HostKeyPrompt, Settings};
 use crate::strip;
@@ -22,6 +22,7 @@ pub struct LightLab {
     password: String,
     connected: Option<String>,
     test_active: Option<String>,
+    run_status: Option<RunStatus>,
     host_prompt: Option<HostKeyPrompt>,
     error: Option<String>,
     log: Vec<LogEntry>,
@@ -69,6 +70,7 @@ impl LightLab {
             password,
             connected: None,
             test_active: None,
+            run_status: None,
             host_prompt: None,
             error: None,
             log: Vec::new(),
@@ -151,6 +153,7 @@ impl LightLab {
         for event in self.remote.poll() {
             match event {
                 RemoteEvent::Connecting(endpoint) => {
+                    self.run_status = None;
                     self.push_log(format!("connecting to {endpoint}"));
                 }
                 RemoteEvent::HostKeyPrompt(prompt) => {
@@ -170,6 +173,7 @@ impl LightLab {
                 }
                 RemoteEvent::TestStarted { script } => {
                     self.test_active = Some(script.clone());
+                    self.run_status = None;
                     self.action.finish();
                     self.push_log(format!("test attached to the switch with {script}"));
                 }
@@ -200,9 +204,19 @@ impl LightLab {
                         }
                     }
                 }
+                RemoteEvent::RunStarted { script } => {
+                    self.action.finish();
+                    self.push_log(format!(
+                        "kept {script} running in the background; it survives closing lightlab"
+                    ));
+                }
+                RemoteEvent::Status(status) => {
+                    self.run_status = Some(status);
+                }
                 RemoteEvent::Disconnected(reason) => {
                     self.connected = None;
                     self.test_active = None;
+                    self.run_status = None;
                     self.host_prompt = None;
                     self.action.finish();
                     match reason {
@@ -319,28 +333,27 @@ impl LightLab {
         }
     }
 
+    fn current_job(&self) -> Result<TestJob, String> {
+        let path = self.config.script_path.trim().to_string();
+        if path.is_empty() {
+            return Err("no animation script selected".into());
+        }
+        let script =
+            std::fs::read(&path).map_err(|error| format!("cannot read {path}: {error}"))?;
+        let settings = self.ssh_settings()?;
+        Ok(TestJob {
+            settings,
+            script_name: path,
+            script,
+        })
+    }
+
     fn start_test(&mut self) {
         if self.action.is_busy() || self.test_active.is_some() {
             return;
         }
-        let path = self.config.script_path.trim().to_string();
-        if path.is_empty() {
-            self.push_error(
-                "Cannot test: no animation script selected. No remote command ran; led_mode and the pidfile were not changed.",
-            );
-            return;
-        }
-        let script = match std::fs::read(&path) {
-            Ok(script) => script,
-            Err(error) => {
-                self.push_error(format!(
-                    "Cannot test: cannot read {path}: {error}. No remote command ran; led_mode and the pidfile were not changed."
-                ));
-                return;
-            }
-        };
-        let settings = match self.ssh_settings() {
-            Ok(settings) => settings,
+        let job = match self.current_job() {
+            Ok(job) => job,
             Err(error) => {
                 self.push_error(format!(
                     "Cannot test: {error}. No remote command ran; led_mode and the pidfile were not changed."
@@ -355,15 +368,43 @@ impl LightLab {
         if let Err(error) = settings::save(&self.config) {
             self.push_log(format!("settings were not saved: {error}"));
         }
-        self.push_log(format!("uploading and attaching {path}"));
-        if let Err(error) = self.remote.start_test(TestJob {
-            settings,
-            script_name: path,
-            script,
-        }) {
+        self.push_log(format!("uploading and attaching {}", job.script_name));
+        if let Err(error) = self.remote.start_test(job) {
             self.action.finish();
             self.push_error(format!(
                 "Cannot test: {error}. No remote command ran; led_mode and the pidfile were not changed."
+            ));
+        }
+    }
+
+    fn keep_action(&mut self) {
+        if self.action.is_busy() {
+            return;
+        }
+        let job = match self.current_job() {
+            Ok(job) => job,
+            Err(error) => {
+                self.push_error(format!(
+                    "Cannot keep running: {error}. No remote command ran; led_mode and the pidfile were not changed."
+                ));
+                return;
+            }
+        };
+        if !self.action.try_begin(ActionKind::Keep) {
+            return;
+        }
+        self.error = None;
+        if let Err(error) = settings::save(&self.config) {
+            self.push_log(format!("settings were not saved: {error}"));
+        }
+        self.push_log(format!(
+            "uploading {} and starting a detached run",
+            job.script_name
+        ));
+        if let Err(error) = self.remote.keep(job) {
+            self.action.finish();
+            self.push_error(format!(
+                "Cannot keep running: {error}. No remote command ran; led_mode and the pidfile were not changed."
             ));
         }
     }
@@ -620,40 +661,103 @@ impl eframe::App for LightLab {
             .show(ctx, |ui| {
                 ui.horizontal(|ui| {
                     let active = self.test_active.is_some();
-                    let starting = self.action.current() == Some(ActionKind::Test);
-                    let stopping = self.action.current() == Some(ActionKind::Stop);
-                    let (status, color) = if starting {
+                    let action = self.action.current();
+                    let starting = action == Some(ActionKind::Test);
+                    let keeping = action == Some(ActionKind::Keep);
+                    let stopping = action == Some(ActionKind::Stop);
+                    let busy = self.action.is_busy();
+                    let (status, color, hover) = if starting {
                         (
                             "attaching test...".to_string(),
                             Color32::from_rgb(230, 176, 100),
+                            "Uploading and attaching the test supervisor.".to_string(),
+                        )
+                    } else if keeping {
+                        (
+                            "starting kept run...".to_string(),
+                            Color32::from_rgb(230, 176, 100),
+                            "Uploading and starting a detached supervisor.".to_string(),
                         )
                     } else if stopping {
                         (
                             "stopping test...".to_string(),
                             Color32::from_rgb(230, 176, 100),
+                            "Waiting for stdin EOF and supervisor cleanup.".to_string(),
+                        )
+                    } else if action == Some(ActionKind::Connect) {
+                        (
+                            "connecting...".to_string(),
+                            Color32::from_rgb(230, 176, 100),
+                            "Opening the SSH session.".to_string(),
+                        )
+                    } else if action == Some(ActionKind::Disconnect) {
+                        (
+                            "disconnecting...".to_string(),
+                            Color32::from_rgb(230, 176, 100),
+                            "Closing the SSH session.".to_string(),
+                        )
+                    } else if let Some(run) = self.run_status.as_ref().filter(|run| run.is_running()) {
+                        let kind = if run.attached { "test" } else { "kept run" };
+                        (
+                            format!(
+                                "{kind} · {} · PID {} · up {}",
+                                run.script,
+                                run.pidfile.unwrap_or_default(),
+                                format_uptime(run.uptime_secs)
+                            ),
+                            Color32::from_rgb(104, 214, 153),
+                            format!(
+                                "{}\ncmdline: {}\nlog {} B",
+                                run.summary(),
+                                run.cmdline.trim(),
+                                run.log_size
+                            ),
                         )
                     } else if let Some(script) = &self.test_active {
                         (
                             format!("test attached · {script}"),
                             Color32::from_rgb(104, 214, 153),
+                            "Test supervisor is attached; waiting for the pidfile.".to_string(),
                         )
                     } else if self.connected.is_some() {
                         (
                             "connected · no run attached".to_string(),
                             Color32::from_rgb(160, 168, 180),
+                            "The switch is idle.".to_string(),
                         )
                     } else {
                         (
                             "idle · not connected".to_string(),
                             Color32::from_rgb(112, 120, 132),
+                            "Enter the switch connection details and connect, or run a test directly."
+                                .to_string(),
                         )
                     };
                     let (dot, _) =
                         ui.allocate_exact_size(egui::vec2(8.0, 8.0), egui::Sense::hover());
                     ui.painter().circle_filled(dot.center(), 3.5, color);
-                    ui.label(RichText::new(status).size(11.0).color(color));
+                    ui.add(
+                        egui::Label::new(RichText::new(status).size(11.0).color(color)).truncate(),
+                    )
+                    .on_hover_text(hover);
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        let busy = self.action.is_busy();
+                        let keep_label = if keeping {
+                            "Keeping..."
+                        } else {
+                            "Keep running"
+                        };
+                        let keep = ui
+                            .add_enabled(
+                                !busy,
+                                egui::Button::new(keep_label)
+                                    .min_size(egui::vec2(130.0, 32.0)),
+                            )
+                            .on_hover_text(
+                                "Starts a detached supervisor that survives closing lightlab.",
+                            );
+                        if keep.clicked() {
+                            self.keep_action();
+                        }
                         let label = if starting {
                             "Attaching..."
                         } else if stopping {
@@ -957,6 +1061,16 @@ impl eframe::App for LightLab {
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
         self.preview.shutdown();
         let _ = settings::save(&self.config);
+    }
+}
+
+fn format_uptime(seconds: u64) -> String {
+    if seconds < 60 {
+        format!("{seconds}s")
+    } else if seconds < 3600 {
+        format!("{}m {:02}s", seconds / 60, seconds % 60)
+    } else {
+        format!("{}h {:02}m", seconds / 3600, (seconds % 3600) / 60)
     }
 }
 
