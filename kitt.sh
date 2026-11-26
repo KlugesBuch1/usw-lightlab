@@ -5,10 +5,9 @@ COLS="$COLS 25/26 27/28 29/30 31/32 33/34 35/36 37/38 39/40 41/42 43/44 45/46 47
 
 MS=22
 DWELL=1
-SYNC=auto
 
 MODE=/proc/led/led_mode
-CODE=/proc/led/led_code
+# The firmware rejects led_code frames, so all output goes through led_color.
 COLOR=/proc/led/led_color
 
 die() {
@@ -84,15 +83,6 @@ if [ "$n" -ne 24 ] || [ "$np" -ne 48 ]; then
     die "layout is not the USW-Pro-Max-48 (expected 24 columns / 48 LEDs, got $n/$np)"
 fi
 
-fmt=
-i=0
-while [ "$i" -lt "$n" ]; do
-    fmt="$fmt%s %02x 00 00 100\n"
-    i=$((i + 1))
-    eval "F$i=\"\$fmt\""
-done
-
-CHUNK=$n
 fail=0
 in_cleanup=0
 
@@ -108,45 +98,14 @@ level() {
     esac
 }
 
-write_chunk() {
-    if ( printf "$f" $ARGS 2>/dev/null > "$CODE" ); then
+put() {
+    if printf '%s r %s\n' "$1" "$(( $2 * 257 ))" 2>/dev/null > "$COLOR"; then
         fail=0
     else
         fail=$((fail + 1))
-        if [ "$fail" -ge 20 ] && [ "$in_cleanup" != 1 ]; then
-            die "$CODE rejects the frames - use a smaller CHUNK or SYNC=color"
+        if [ "$fail" -ge 40 ] && [ "$in_cleanup" != 1 ]; then
+            die "$COLOR rejects the writes"
         fi
-    fi
-}
-
-put() {
-    if [ "$use_code" != 1 ]; then
-        if printf '%s r %s\n' "$1" "$(( $2 * 257 ))" 2>/dev/null > "$COLOR"; then
-            fail=0
-        else
-            fail=$((fail + 1))
-            if [ "$fail" -ge 40 ] && [ "$in_cleanup" != 1 ]; then
-                die "$COLOR rejects the writes"
-            fi
-        fi
-        return
-    fi
-    ARGS="$ARGS $1 $2"
-    cnt=$((cnt + 1))
-    if [ "$cnt" -ge "$CHUNK" ]; then
-        eval "f=\$F$cnt"
-        write_chunk
-        ARGS=
-        cnt=0
-    fi
-}
-
-flush_chunk() {
-    if [ "$cnt" -gt 0 ]; then
-        eval "f=\$F$cnt"
-        write_chunk
-        ARGS=
-        cnt=0
     fi
 }
 
@@ -154,8 +113,6 @@ render() {
     rpos=$1
     rdir=$2
     i=0
-    ARGS=
-    cnt=0
     for c in $COLS; do
         level "$(( (rpos - i) * rdir ))"
         put "${c%%/*}" "$R"
@@ -164,24 +121,14 @@ render() {
         esac
         i=$((i + 1))
     done
-    flush_chunk
 }
 
 clear_all() {
-    if [ "$use_code" = 1 ]; then
-        ARGS=
-        cnt=0
-        for p in $PORTS; do
-            put "$p" 0
-        done
-        flush_chunk
-    else
-        for p in $PORTS; do
-            printf '%s r 0\n' "$p" 2>/dev/null > "$COLOR"
-            printf '%s g 0\n' "$p" 2>/dev/null > "$COLOR"
-            printf '%s b 0\n' "$p" 2>/dev/null > "$COLOR"
-        done
-    fi
+    for p in $PORTS; do
+        printf '%s r 0\n' "$p" 2>/dev/null > "$COLOR"
+        printf '%s g 0\n' "$p" 2>/dev/null > "$COLOR"
+        printf '%s b 0\n' "$p" 2>/dev/null > "$COLOR"
+    done
 }
 
 cleanup() {
@@ -196,48 +143,13 @@ trap 'exit 0' INT TERM
 
 echo $$ > /tmp/kitt.pid
 
+[ -w "$COLOR" ] || die "$COLOR missing or not writable (id; ls -l /proc/led)"
+
 echo 0 > "$MODE" 2>/dev/null || die "cannot set led_mode to 0 (not root?)"
-
-use_code=0
-if [ "$SYNC" != color ] && [ -w "$CODE" ]; then
-    best=0
-    for k in 1 2 4 8 12 16 20 24; do
-        [ "$k" -le "$n" ] || break
-        eval "f=\$F$k"
-        args=
-        j=0
-        for pp in $PORTS; do
-            [ "$j" -lt "$k" ] || break
-            args="$args $pp 0"
-            j=$((j + 1))
-        done
-        if ( printf "$f" $args 2>/dev/null > "$CODE" ); then
-            best=$k
-        else
-            break
-        fi
-    done
-    if [ "$best" -gt 0 ]; then
-        use_code=1
-        CHUNK=$best
-    fi
-fi
-
-if [ "$SYNC" = code ] && [ "$use_code" != 1 ]; then
-    die "led_code does not accept frames - SYNC=code not possible"
-fi
-if [ "$use_code" != 1 ]; then
-    [ -w "$COLOR" ] || die "neither led_code nor led_color is writable"
-fi
 
 clear_all
 
-if [ "$use_code" = 1 ]; then
-    how="led_code, $CHUNK rows/write"
-else
-    how="led_color (not synchronized - led_code rejected)"
-fi
-echo "kitt: $n columns / $np LEDs, ${MS} ms/step, timer=$timer, $how - Ctrl+C to stop."
+echo "kitt: $n columns / $np LEDs, ${MS} ms/step, timer=$timer - Ctrl+C to stop."
 
 last=$((n - 1))
 pos=0
