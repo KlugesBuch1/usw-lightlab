@@ -9,17 +9,20 @@ DWELL=1
 MODE=/proc/led/led_mode
 # The firmware rejects led_code frames, so all output goes through led_color.
 COLOR=/proc/led/led_color
+EMIT=${LIGHTLAB_EMIT:-0}
 
 die() {
     echo "kitt: $*" >&2
     exit 1
 }
 
-[ -w "$MODE" ] || die "$MODE missing or not writable (id; ls -l /proc/led)"
+[ "$EMIT" = 1 ] || [ -w "$MODE" ] || die "$MODE missing or not writable (id; ls -l /proc/led)"
 
-uid=$(id -u 2>/dev/null)
-if [ -n "$uid" ] && [ "$uid" != 0 ]; then
-    die "not root (uid=$uid) - /proc/led requires root."
+if [ "$EMIT" != 1 ]; then
+    uid=$(id -u 2>/dev/null)
+    if [ -n "$uid" ] && [ "$uid" != 0 ]; then
+        die "not root (uid=$uid) - /proc/led requires root."
+    fi
 fi
 
 secs=$(printf '0.%03d' "$MS")
@@ -99,7 +102,10 @@ level() {
 }
 
 put() {
-    if printf '%s r %s\n' "$1" "$(( $2 * 257 ))" 2>/dev/null > "$COLOR"; then
+    if [ "$EMIT" = 1 ]; then
+        printf '%s r %s\n' "$1" "$(( $2 * 257 ))"
+        fail=0
+    elif printf '%s r %s\n' "$1" "$(( $2 * 257 ))" 2>/dev/null > "$COLOR"; then
         fail=0
     else
         fail=$((fail + 1))
@@ -123,18 +129,32 @@ render() {
     done
 }
 
+set_mode() {
+    if [ "$EMIT" = 1 ]; then
+        printf 'mode %s\n' "$1"
+    else
+        echo "$1" > "$MODE" 2>/dev/null
+    fi
+}
+
 clear_all() {
     for p in $PORTS; do
-        printf '%s r 0\n' "$p" 2>/dev/null > "$COLOR"
-        printf '%s g 0\n' "$p" 2>/dev/null > "$COLOR"
-        printf '%s b 0\n' "$p" 2>/dev/null > "$COLOR"
+        if [ "$EMIT" = 1 ]; then
+            printf '%s r 0\n' "$p"
+            printf '%s g 0\n' "$p"
+            printf '%s b 0\n' "$p"
+        else
+            printf '%s r 0\n' "$p" 2>/dev/null > "$COLOR"
+            printf '%s g 0\n' "$p" 2>/dev/null > "$COLOR"
+            printf '%s b 0\n' "$p" 2>/dev/null > "$COLOR"
+        fi
     done
 }
 
 cleanup() {
     in_cleanup=1
     clear_all
-    echo 1 > "$MODE" 2>/dev/null
+    set_mode 1
     rm -f /tmp/kitt.pid
     echo "kitt: stopped, LEDs back under firmware control."
 }
@@ -143,9 +163,9 @@ trap 'exit 0' INT TERM
 
 echo $$ > /tmp/kitt.pid
 
-[ -w "$COLOR" ] || die "$COLOR missing or not writable (id; ls -l /proc/led)"
+[ "$EMIT" = 1 ] || [ -w "$COLOR" ] || die "$COLOR missing or not writable (id; ls -l /proc/led)"
 
-echo 0 > "$MODE" 2>/dev/null || die "cannot set led_mode to 0 (not root?)"
+set_mode 0 || die "cannot set led_mode to 0 (not root?)"
 
 clear_all
 
