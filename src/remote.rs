@@ -1,14 +1,19 @@
+use std::path::Path;
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::Arc;
 use std::time::Duration;
 
 use eframe::egui;
 use russh::client::Handle;
-use russh::Disconnect;
+use russh::{ChannelMsg, Disconnect};
 use tokio::sync::mpsc::{self as tokio_mpsc, UnboundedSender};
 
 use crate::settings;
 use crate::ssh::{self, Handler, HostKeyPrompt, Settings};
+
+const REMOTE_DIR: &str = "/tmp/usw-lightlab";
+const REMOTE_SUPERVISOR: &str = "/tmp/usw-lightlab/lightlab-run.sh";
+const SUPERVISOR: &str = include_str!("../lightlab-run.sh");
 
 pub struct Remote {
     commands: UnboundedSender<Command>,
@@ -150,5 +155,166 @@ async fn connect(settings: Settings, session: &mut Option<Handle<Handler>>, sink
                 "{error}. No remote command ran; led_mode and the pidfile were not changed."
             )));
         }
+    }
+}
+
+async fn upload_animation(
+    handle: &Handle<Handler>,
+    script_name: &str,
+    script: &[u8],
+) -> Result<String, String> {
+    let name = safe_animation_name(Path::new(script_name));
+    exec_checked(
+        handle,
+        &format!("mkdir -p {REMOTE_DIR} && chmod 700 {REMOTE_DIR}"),
+        None,
+    )
+    .await?;
+
+    let supervisor = SUPERVISOR.replace("\r\n", "\n");
+    write_remote(handle, REMOTE_SUPERVISOR, supervisor.as_bytes()).await?;
+
+    let animation = match std::str::from_utf8(script) {
+        Ok(text) => text.replace("\r\n", "\n").into_bytes(),
+        Err(_) => script.to_vec(),
+    };
+    let animation_path = format!("{REMOTE_DIR}/{name}");
+    write_remote(handle, &animation_path, &animation).await?;
+
+    let check = format!(
+        "sh -n {} && sh -n {}",
+        sh_quote(REMOTE_SUPERVISOR),
+        sh_quote(&animation_path)
+    );
+    exec_checked(handle, &check, None)
+        .await
+        .map_err(|error| format!("uploaded scripts did not pass sh -n: {error}"))?;
+    Ok(name)
+}
+
+async fn write_remote(handle: &Handle<Handler>, path: &str, contents: &[u8]) -> Result<(), String> {
+    let command = format!("cat > {}", sh_quote(path));
+    let output = exec(handle, &command, Some(contents)).await?;
+    if output.code != Some(0) {
+        return Err(format!("cannot write {path}: {}", output.error_text()));
+    }
+    Ok(())
+}
+
+async fn exec_checked(
+    handle: &Handle<Handler>,
+    command: &str,
+    input: Option<&[u8]>,
+) -> Result<(), String> {
+    let output = exec(handle, command, input).await?;
+    if output.code == Some(0) {
+        Ok(())
+    } else {
+        Err(format!(
+            "command failed: {command}: {}",
+            output.error_text()
+        ))
+    }
+}
+
+async fn exec(
+    handle: &Handle<Handler>,
+    command: &str,
+    input: Option<&[u8]>,
+) -> Result<ExecOutput, String> {
+    let mut channel = handle
+        .channel_open_session()
+        .await
+        .map_err(|error| format!("cannot open an SSH channel: {error}"))?;
+    channel
+        .exec(true, command)
+        .await
+        .map_err(|error| format!("cannot run on the switch: {error}"))?;
+    if let Some(input) = input {
+        channel
+            .data_bytes(input.to_vec())
+            .await
+            .map_err(|error| format!("cannot send data to the switch: {error}"))?;
+    }
+    channel
+        .eof()
+        .await
+        .map_err(|error| format!("cannot close SSH stdin: {error}"))?;
+
+    let mut output = ExecOutput::default();
+    while let Some(message) = channel.wait().await {
+        match message {
+            ChannelMsg::Data { data } => output.stdout.extend_from_slice(&data),
+            ChannelMsg::ExtendedData { data, .. } => output.stderr.extend_from_slice(&data),
+            ChannelMsg::ExitStatus { exit_status } => output.code = Some(exit_status),
+            _ => {}
+        }
+    }
+    Ok(output)
+}
+
+#[derive(Default)]
+struct ExecOutput {
+    stdout: Vec<u8>,
+    stderr: Vec<u8>,
+    code: Option<u32>,
+}
+
+impl ExecOutput {
+    fn error_text(&self) -> String {
+        let stderr = String::from_utf8_lossy(&self.stderr);
+        let stdout = String::from_utf8_lossy(&self.stdout);
+        let text = if stderr.trim().is_empty() {
+            stdout.trim()
+        } else {
+            stderr.trim()
+        };
+        if text.is_empty() {
+            format!("exit status {:?}", self.code)
+        } else {
+            text.to_string()
+        }
+    }
+}
+
+fn safe_animation_name(path: &Path) -> String {
+    let base = path
+        .file_name()
+        .map(|name| name.to_string_lossy().to_string())
+        .unwrap_or_default();
+    let mut name: String = base
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || matches!(ch, '.' | '_' | '-') {
+                ch
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    if name.chars().count() > 100 {
+        name = name.chars().take(100).collect();
+    }
+    if name.is_empty() || name == "." || name == ".." || name.starts_with('.') {
+        return "animation.sh".into();
+    }
+    name
+}
+
+fn sh_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\\''"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sanitizes_animation_names() {
+        assert_eq!(safe_animation_name(Path::new("kitt.sh")), "kitt.sh");
+        assert_eq!(safe_animation_name(Path::new("my kitt.sh")), "my_kitt.sh");
+        assert_eq!(safe_animation_name(Path::new("../../etc/passwd")), "passwd");
+        assert_eq!(safe_animation_name(Path::new("")), "animation.sh");
+        assert_eq!(safe_animation_name(Path::new(".hidden")), "animation.sh");
     }
 }
