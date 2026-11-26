@@ -2,6 +2,7 @@
 
 mod app;
 mod led;
+mod preview;
 mod strip;
 
 use eframe::egui;

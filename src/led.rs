@@ -16,14 +16,6 @@ impl Channel {
         }
     }
 
-    pub fn token(self) -> &'static str {
-        match self {
-            Self::Red => "r",
-            Self::Green => "g",
-            Self::Blue => "b",
-        }
-    }
-
     pub fn from_token(token: &str) -> Option<Self> {
         match token {
             "r" => Some(Self::Red),
@@ -58,13 +50,6 @@ impl Leds {
         }
     }
 
-    pub fn get(&self, port: usize, channel: Channel) -> u16 {
-        port.checked_sub(1)
-            .and_then(|index| self.values.get(index))
-            .map(|slot| slot[channel.index()])
-            .unwrap_or(0)
-    }
-
     pub fn port(&self, port: usize) -> [u16; 3] {
         port.checked_sub(1)
             .and_then(|index| self.values.get(index))
@@ -74,10 +59,6 @@ impl Leds {
 
     pub fn clear(&mut self) {
         self.values = [[0; 3]; PORT_COUNT];
-    }
-
-    pub fn is_dark(&self) -> bool {
-        self.values.iter().all(|slot| slot == &[0; 3])
     }
 }
 
@@ -114,22 +95,6 @@ pub fn parse_line(line: &str) -> Option<LedLine> {
     })
 }
 
-impl Leds {
-    pub fn apply_line(&mut self, line: &str) -> Option<LedLine> {
-        match parse_line(line)? {
-            parsed @ LedLine::Color {
-                port,
-                channel,
-                value,
-            } => {
-                self.set(port, channel, value);
-                Some(parsed)
-            }
-            parsed @ LedLine::Mode(_) => Some(parsed),
-        }
-    }
-}
-
 pub fn to_u8(value: u16) -> u8 {
     (value as u32 * 255 / 65535) as u8
 }
@@ -143,11 +108,8 @@ mod tests {
         let mut leds = Leds::new();
         leds.set(1, Channel::Red, 65535);
         leds.set(48, Channel::Blue, 514);
-        assert_eq!(leds.get(1, Channel::Red), 65535);
-        assert_eq!(leds.get(48, Channel::Blue), 514);
         assert_eq!(leds.port(1), [65535, 0, 0]);
         assert_eq!(leds.port(48), [0, 0, 514]);
-        assert!(!leds.is_dark());
     }
 
     #[test]
@@ -155,7 +117,7 @@ mod tests {
         let mut leds = Leds::new();
         leds.set(0, Channel::Red, 65535);
         leds.set(49, Channel::Red, 65535);
-        assert!(leds.is_dark());
+        assert_eq!(leds.port(1), [0, 0, 0]);
     }
 
     #[test]
@@ -216,23 +178,5 @@ mod tests {
         ] {
             assert_eq!(parse_line(line), None, "{line:?}");
         }
-    }
-
-    #[test]
-    fn applies_color_writes_only() {
-        let mut leds = Leds::new();
-        assert_eq!(
-            leds.apply_line("3 r 35980"),
-            Some(LedLine::Color {
-                port: 3,
-                channel: Channel::Red,
-                value: 35980,
-            })
-        );
-        assert_eq!(leds.get(3, Channel::Red), 35980);
-        leds.apply_line("mode 1");
-        assert_eq!(leds.get(3, Channel::Red), 35980);
-        leds.apply_line("not a frame");
-        assert_eq!(leds.get(3, Channel::Red), 35980);
     }
 }
