@@ -8,7 +8,7 @@ use eframe::egui::{
 use crate::action::{ActionGate, ActionKind};
 use crate::led::{LedLine, Leds};
 use crate::preview::{Preview, PreviewEvent};
-use crate::remote::{Remote, RemoteEvent};
+use crate::remote::{Remote, RemoteEvent, TestJob};
 use crate::settings::{self, AuthMode, Config};
 use crate::ssh::{HostKeyPrompt, Settings};
 use crate::strip;
@@ -21,6 +21,7 @@ pub struct LightLab {
     config: Config,
     password: String,
     connected: Option<String>,
+    test_active: Option<String>,
     host_prompt: Option<HostKeyPrompt>,
     error: Option<String>,
     log: Vec<LogEntry>,
@@ -67,6 +68,7 @@ impl LightLab {
             config,
             password,
             connected: None,
+            test_active: None,
             host_prompt: None,
             error: None,
             log: Vec::new(),
@@ -157,15 +159,50 @@ impl LightLab {
                 RemoteEvent::Connected(endpoint) => {
                     self.connected = Some(endpoint.clone());
                     self.host_prompt = None;
-                    self.action.finish();
+                    if self.action.current() == Some(ActionKind::Connect) {
+                        self.action.finish();
+                    }
                     self.save_password();
                     if let Err(error) = settings::save(&self.config) {
                         self.push_log(format!("settings were not saved: {error}"));
                     }
                     self.push_log(format!("SSH connected to {endpoint}"));
                 }
+                RemoteEvent::TestStarted { script } => {
+                    self.test_active = Some(script.clone());
+                    self.action.finish();
+                    self.push_log(format!("test attached to the switch with {script}"));
+                }
+                RemoteEvent::TestOutput(text) => self.push_log(text),
+                RemoteEvent::TestExited {
+                    script,
+                    code,
+                    stopped,
+                    error,
+                } => {
+                    self.test_active = None;
+                    self.action.finish();
+                    if let Some(error) = error {
+                        self.push_error(error);
+                    } else if stopped {
+                        match code {
+                            Some(code) => self.push_log(format!(
+                                "test stopped; switch cleanup finished (exit {code})"
+                            )),
+                            None => self.push_log("test stopped"),
+                        }
+                    } else {
+                        match code {
+                            Some(code) => {
+                                self.push_log(format!("{script} exited with status {code}"))
+                            }
+                            None => self.push_log(format!("{script} exited")),
+                        }
+                    }
+                }
                 RemoteEvent::Disconnected(reason) => {
                     self.connected = None;
+                    self.test_active = None;
                     self.host_prompt = None;
                     self.action.finish();
                     match reason {
@@ -174,7 +211,7 @@ impl LightLab {
                     }
                 }
                 RemoteEvent::Error(message) => {
-                    self.connected = None;
+                    self.test_active = None;
                     self.host_prompt = None;
                     self.action.finish();
                     self.push_error(message);
@@ -271,6 +308,73 @@ impl LightLab {
             self.push_error(format!(
                 "Cannot connect: {error}. No remote command ran; led_mode and the pidfile were not changed."
             ));
+        }
+    }
+
+    fn test_action(&mut self) {
+        if self.test_active.is_some() {
+            self.stop_test();
+        } else {
+            self.start_test();
+        }
+    }
+
+    fn start_test(&mut self) {
+        if self.action.is_busy() || self.test_active.is_some() {
+            return;
+        }
+        let path = self.config.script_path.trim().to_string();
+        if path.is_empty() {
+            self.push_error(
+                "Cannot test: no animation script selected. No remote command ran; led_mode and the pidfile were not changed.",
+            );
+            return;
+        }
+        let script = match std::fs::read(&path) {
+            Ok(script) => script,
+            Err(error) => {
+                self.push_error(format!(
+                    "Cannot test: cannot read {path}: {error}. No remote command ran; led_mode and the pidfile were not changed."
+                ));
+                return;
+            }
+        };
+        let settings = match self.ssh_settings() {
+            Ok(settings) => settings,
+            Err(error) => {
+                self.push_error(format!(
+                    "Cannot test: {error}. No remote command ran; led_mode and the pidfile were not changed."
+                ));
+                return;
+            }
+        };
+        if !self.action.try_begin(ActionKind::Test) {
+            return;
+        }
+        self.error = None;
+        if let Err(error) = settings::save(&self.config) {
+            self.push_log(format!("settings were not saved: {error}"));
+        }
+        self.push_log(format!("uploading and attaching {path}"));
+        if let Err(error) = self.remote.start_test(TestJob {
+            settings,
+            script_name: path,
+            script,
+        }) {
+            self.action.finish();
+            self.push_error(format!(
+                "Cannot test: {error}. No remote command ran; led_mode and the pidfile were not changed."
+            ));
+        }
+    }
+
+    fn stop_test(&mut self) {
+        if !self.action.try_begin(ActionKind::Stop) {
+            return;
+        }
+        if let Err(error) = self.remote.stop_test() {
+            self.action.finish();
+            self.push_error(format!("cannot stop the test: {error}"));
         }
     }
 
@@ -450,8 +554,8 @@ impl eframe::App for LightLab {
 
         egui::TopBottomPanel::bottom("log")
             .resizable(true)
-            .default_height(170.0)
-            .min_height(120.0)
+            .default_height(150.0)
+            .min_height(105.0)
             .frame(
                 egui::Frame::NONE
                     .fill(Color32::from_rgb(9, 11, 14))
@@ -504,6 +608,78 @@ impl eframe::App for LightLab {
                             );
                         }
                     });
+            });
+
+        egui::TopBottomPanel::bottom("actions")
+            .frame(
+                egui::Frame::NONE
+                    .fill(Color32::from_rgb(17, 20, 25))
+                    .inner_margin(Margin::symmetric(22, 10))
+                    .stroke(Stroke::new(1.0_f32, Color32::from_rgb(31, 36, 44))),
+            )
+            .show(ctx, |ui| {
+                ui.horizontal(|ui| {
+                    let active = self.test_active.is_some();
+                    let starting = self.action.current() == Some(ActionKind::Test);
+                    let stopping = self.action.current() == Some(ActionKind::Stop);
+                    let (status, color) = if starting {
+                        (
+                            "attaching test...".to_string(),
+                            Color32::from_rgb(230, 176, 100),
+                        )
+                    } else if stopping {
+                        (
+                            "stopping test...".to_string(),
+                            Color32::from_rgb(230, 176, 100),
+                        )
+                    } else if let Some(script) = &self.test_active {
+                        (
+                            format!("test attached · {script}"),
+                            Color32::from_rgb(104, 214, 153),
+                        )
+                    } else if self.connected.is_some() {
+                        (
+                            "connected · no run attached".to_string(),
+                            Color32::from_rgb(160, 168, 180),
+                        )
+                    } else {
+                        (
+                            "idle · not connected".to_string(),
+                            Color32::from_rgb(112, 120, 132),
+                        )
+                    };
+                    let (dot, _) =
+                        ui.allocate_exact_size(egui::vec2(8.0, 8.0), egui::Sense::hover());
+                    ui.painter().circle_filled(dot.center(), 3.5, color);
+                    ui.label(RichText::new(status).size(11.0).color(color));
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        let busy = self.action.is_busy();
+                        let label = if starting {
+                            "Attaching..."
+                        } else if stopping {
+                            "Stopping..."
+                        } else if active {
+                            "Stop test"
+                        } else {
+                            "Test animation"
+                        };
+                        let button = ui
+                            .add_enabled(
+                                !busy,
+                                egui::Button::new(RichText::new(label).color(Color32::WHITE))
+                                    .min_size(egui::vec2(150.0, 32.0))
+                                    .fill(Color32::from_rgb(196, 43, 56)),
+                            )
+                            .on_hover_text(if active {
+                                "Stop closes test stdin; the supervisor restores LEDs."
+                            } else {
+                                "Uploads and attaches a test run, stopping it on Stop or disconnect."
+                            });
+                        if button.clicked() {
+                            self.test_action();
+                        }
+                    });
+                });
             });
 
         egui::CentralPanel::default()
@@ -627,6 +803,7 @@ impl eframe::App for LightLab {
                         ui.add_space(12.0);
 
                         let busy = self.action.is_busy();
+                        let locked = busy || self.test_active.is_some() || self.connected.is_some();
                         egui::Frame::NONE
                             .fill(Color32::from_rgb(19, 22, 28))
                             .stroke(Stroke::new(1.0_f32, Color32::from_rgb(31, 36, 44)))
@@ -653,7 +830,7 @@ impl eframe::App for LightLab {
                                         |ui| {
                                             if ui
                                                 .add_enabled(
-                                                    !busy,
+                                                    !busy && self.test_active.is_none(),
                                                     egui::Button::new(connect_label)
                                                         .min_size(egui::vec2(110.0, 30.0)),
                                                 )
@@ -684,7 +861,7 @@ impl eframe::App for LightLab {
                                     );
                                 });
                                 ui.add_space(10.0);
-                                ui.add_enabled_ui(!busy, |ui| {
+                                ui.add_enabled_ui(!locked, |ui| {
                                     ui.horizontal(|ui| {
                                         ui.label(section_label("HOST"));
                                         ui.add_sized(
