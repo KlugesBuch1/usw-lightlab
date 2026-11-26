@@ -290,6 +290,6 @@ mod tests {
             reply: Some(tx),
         };
         prompt.answer(true);
-        assert_eq!(rx.try_recv().unwrap(), true);
+        assert!(rx.try_recv().unwrap());
     }
 }
