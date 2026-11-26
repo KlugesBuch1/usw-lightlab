@@ -213,6 +213,10 @@ impl LightLab {
                 RemoteEvent::Status(status) => {
                     self.run_status = Some(status);
                 }
+                RemoteEvent::KillFinished { message } => {
+                    self.action.finish();
+                    self.push_log(message);
+                }
                 RemoteEvent::Disconnected(reason) => {
                     self.connected = None;
                     self.test_active = None;
@@ -416,6 +420,35 @@ impl LightLab {
         if let Err(error) = self.remote.stop_test() {
             self.action.finish();
             self.push_error(format!("cannot stop the test: {error}"));
+        }
+    }
+
+    fn kill_action(&mut self) {
+        if self.action.is_busy() || self.test_active.is_some() {
+            return;
+        }
+        let settings = match self.ssh_settings() {
+            Ok(settings) => settings,
+            Err(error) => {
+                self.push_error(format!(
+                    "Cannot kill: {error}. No remote command ran; led_mode and the pidfile were not changed."
+                ));
+                return;
+            }
+        };
+        if !self.action.try_begin(ActionKind::Kill) {
+            return;
+        }
+        self.error = None;
+        if let Err(error) = settings::save(&self.config) {
+            self.push_log(format!("settings were not saved: {error}"));
+        }
+        self.push_log("verifying the pidfile and stopping any kept run");
+        if let Err(error) = self.remote.kill(settings) {
+            self.action.finish();
+            self.push_error(format!(
+                "Cannot kill: {error}. No remote command ran; led_mode and the pidfile were not changed."
+            ));
         }
     }
 
@@ -665,6 +698,7 @@ impl eframe::App for LightLab {
                     let starting = action == Some(ActionKind::Test);
                     let keeping = action == Some(ActionKind::Keep);
                     let stopping = action == Some(ActionKind::Stop);
+                    let killing = action == Some(ActionKind::Kill);
                     let busy = self.action.is_busy();
                     let (status, color, hover) = if starting {
                         (
@@ -683,6 +717,12 @@ impl eframe::App for LightLab {
                             "stopping test...".to_string(),
                             Color32::from_rgb(230, 176, 100),
                             "Waiting for stdin EOF and supervisor cleanup.".to_string(),
+                        )
+                    } else if killing {
+                        (
+                            "stopping run and restoring LEDs...".to_string(),
+                            Color32::from_rgb(230, 176, 100),
+                            "Verifying the pidfile, waiting up to 5 seconds, then clearing ports and setting led_mode=1.".to_string(),
                         )
                     } else if action == Some(ActionKind::Connect) {
                         (
@@ -741,6 +781,24 @@ impl eframe::App for LightLab {
                     )
                     .on_hover_text(hover);
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        let kill_label = if killing { "Killing..." } else { "Kill" };
+                        let kill = ui
+                            .add_enabled(
+                                !busy && !active,
+                                egui::Button::new(
+                                    RichText::new(kill_label).color(Color32::from_rgb(255, 179, 186)),
+                                )
+                                .min_size(egui::vec2(92.0, 32.0))
+                                .fill(Color32::from_rgb(59, 22, 27)),
+                            )
+                            .on_hover_text(if active {
+                                "Use Stop test for an attached test."
+                            } else {
+                                "Verifies the pidfile PID, stops it, then clears the LEDs and sets led_mode=1."
+                            });
+                        if kill.clicked() {
+                            self.kill_action();
+                        }
                         let keep_label = if keeping {
                             "Keeping..."
                         } else {

@@ -16,6 +16,77 @@ const REMOTE_DIR: &str = "/tmp/usw-lightlab";
 const REMOTE_SUPERVISOR: &str = "/tmp/usw-lightlab/lightlab-run.sh";
 const SUPERVISOR: &str = include_str!("../lightlab-run.sh");
 
+const KILL_SCRIPT: &str = r#"pidfile=/tmp/usw-lightlab.pid
+mode=/proc/led/led_mode
+color=/proc/led/led_color
+present=0
+[ -e "$pidfile" ] && present=1
+pid=$(cat "$pidfile" 2>/dev/null)
+malformed=0
+case $pid in
+    '')
+        [ "$present" = 1 ] && malformed=1
+        ;;
+    *[!0-9]*)
+        malformed=1
+        pid=
+        ;;
+esac
+verified=0
+unrelated=0
+if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
+    cmd=$(tr '\0' ' ' < "/proc/$pid/cmdline" 2>/dev/null)
+    case $cmd in
+        *lightlab-run.sh*) verified=1 ;;
+        *) unrelated=1 ;;
+    esac
+fi
+result=no-run
+if [ "$verified" = 1 ]; then
+    kill -TERM "$pid" 2>/dev/null
+    tries=0
+    while kill -0 "$pid" 2>/dev/null && [ "$tries" -lt 50 ]; do
+        sleep 0.1
+        tries=$((tries + 1))
+    done
+    if kill -0 "$pid" 2>/dev/null; then
+        cmd=$(tr '\0' ' ' < "/proc/$pid/cmdline" 2>/dev/null)
+        case $cmd in
+            *lightlab-run.sh*)
+                kill -KILL "$pid" 2>/dev/null
+                result=killed
+                ;;
+            *) result=changed ;;
+        esac
+    else
+        result=termed
+    fi
+elif [ "$unrelated" = 1 ]; then
+    echo "warning: pidfile PID $pid is live but is not lightlab-run.sh; not signalling" >&2
+    result=unrelated
+fi
+clear_fails=0
+port=1
+while [ "$port" -le 48 ]; do
+    printf '%s r 0\n' "$port" > "$color" 2>/dev/null || clear_fails=$((clear_fails + 1))
+    printf '%s g 0\n' "$port" > "$color" 2>/dev/null || clear_fails=$((clear_fails + 1))
+    printf '%s b 0\n' "$port" > "$color" 2>/dev/null || clear_fails=$((clear_fails + 1))
+    port=$((port + 1))
+done
+echo 1 > "$mode" 2>/dev/null || clear_fails=$((clear_fails + 1))
+current=$(cat "$pidfile" 2>/dev/null)
+if [ -n "$pid" ] && [ "$current" = "$pid" ]; then
+    rm -f "$pidfile"
+fi
+[ "$malformed" = 1 ] && rm -f "$pidfile"
+printf 'RESULT=%s\n' "$result"
+printf 'PID=%s\n' "$pid"
+printf 'MODE=%s\n' "$(cat "$mode" 2>/dev/null)"
+printf 'PRESENT=%s\n' "$([ -e "$pidfile" ] && echo 1 || echo 0)"
+printf 'PIDFILE=%s\n' "$(cat "$pidfile" 2>/dev/null)"
+printf 'CLEAR_FAILS=%s\n' "$clear_fails"
+"#;
+
 const STATUS_SCRIPT: &str = r#"pidfile=/tmp/usw-lightlab.pid
 mode=$(cat /proc/led/led_mode 2>/dev/null)
 present=0
@@ -105,6 +176,9 @@ pub enum RemoteEvent {
         script: String,
     },
     Status(RunStatus),
+    KillFinished {
+        message: String,
+    },
     Error(String),
     Log(String),
 }
@@ -121,6 +195,7 @@ enum Command {
     StartTest(TestJob),
     StopTest,
     Keep(TestJob),
+    Kill(Settings),
 }
 
 #[derive(Clone, Debug, Default)]
@@ -245,6 +320,12 @@ impl Remote {
             .map_err(|_| "the SSH worker is not running".to_string())
     }
 
+    pub fn kill(&self, settings: Settings) -> Result<(), String> {
+        self.commands
+            .send(Command::Kill(settings))
+            .map_err(|_| "the SSH worker is not running".to_string())
+    }
+
     pub fn poll(&self) -> Vec<RemoteEvent> {
         self.events.try_iter().collect()
     }
@@ -299,6 +380,10 @@ async fn run(mut commands: tokio_mpsc::UnboundedReceiver<Command>, sink: Sink) {
                     }
                     Command::Keep(job) => {
                         keep(job, &mut session, &mut log_offset, &sink).await;
+                        last_poll_error = None;
+                    }
+                    Command::Kill(settings) => {
+                        kill(settings, &mut session, &mut log_offset, &sink).await;
                         last_poll_error = None;
                     }
                 }
@@ -498,6 +583,123 @@ async fn keep(
         }
         tokio::time::sleep(Duration::from_millis(150)).await;
     }
+}
+
+async fn kill(
+    settings: Settings,
+    session: &mut Option<Handle<Handler>>,
+    log_offset: &mut u64,
+    sink: &Sink,
+) {
+    if !ensure_connected(&settings, session, sink).await {
+        return;
+    }
+    let handle = session.as_ref().unwrap();
+    let output = match exec(handle, KILL_SCRIPT, None).await {
+        Ok(output) => output,
+        Err(error) => {
+            let state = state_or_unknown(handle).await;
+            sink.emit(RemoteEvent::Error(format!(
+                "cannot run the kill sequence: {error}. {state}."
+            )));
+            return;
+        }
+    };
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    if !stderr.is_empty() {
+        sink.emit(RemoteEvent::Log(stderr));
+    }
+    if output.code != Some(0) {
+        let state = state_or_unknown(handle).await;
+        sink.emit(RemoteEvent::Error(format!(
+            "the kill sequence failed: {}. {state}.",
+            output.error_text()
+        )));
+        return;
+    }
+    let report = match parse_kill(&String::from_utf8_lossy(&output.stdout)) {
+        Ok(report) => report,
+        Err(error) => {
+            let state = state_or_unknown(handle).await;
+            sink.emit(RemoteEvent::Error(format!(
+                "cannot read the kill result: {error}. {state}."
+            )));
+            return;
+        }
+    };
+    if let Err(error) = poll_status(handle, log_offset, sink).await {
+        sink.emit(RemoteEvent::Log(format!("status poll failed: {error}")));
+    }
+    let message = report.summary();
+    if report.clear_fails > 0 {
+        sink.emit(RemoteEvent::Error(format!(
+            "{message}. LED restore failed on {} writes.",
+            report.clear_fails
+        )));
+    } else {
+        sink.emit(RemoteEvent::KillFinished { message });
+    }
+}
+
+struct KillReport {
+    result: String,
+    pid: Option<u32>,
+    mode: Option<String>,
+    pidfile_present: bool,
+    clear_fails: u64,
+}
+
+impl KillReport {
+    fn summary(&self) -> String {
+        let pid = self.pid.map(|pid| pid.to_string()).unwrap_or_default();
+        let action = match self.result.as_str() {
+            "termed" => format!("stopped PID {pid} with TERM"),
+            "killed" => format!("stopped PID {pid} with KILL after 5 seconds"),
+            "unrelated" => {
+                format!("pidfile PID {pid} was not lightlab-run.sh and was not signalled")
+            }
+            "changed" => {
+                format!("PID {pid} changed during the 5 second wait and was not KILLed")
+            }
+            "no-run" => "no run was found".into(),
+            other => format!("kill result {other}"),
+        };
+        let mode = self.mode.as_deref().unwrap_or("unknown");
+        let pidfile = if self.pidfile_present {
+            "pidfile still present"
+        } else {
+            "pidfile absent"
+        };
+        format!("{action}; led_mode={mode}; {pidfile}")
+    }
+}
+
+fn parse_kill(text: &str) -> Result<KillReport, String> {
+    let mut result = None;
+    let mut pid = None;
+    let mut mode = None;
+    let mut present = false;
+    let mut clear_fails = 0;
+    for line in text.lines() {
+        let Some((key, value)) = line.split_once('=') else {
+            continue;
+        };
+        match key {
+            "RESULT" => result = Some(value.to_string()),
+            "PID" => pid = value.parse::<u32>().ok(),
+            "MODE" => mode = Some(value.to_string()),
+            "PRESENT" => present = value == "1",
+            "CLEAR_FAILS" => clear_fails = value.parse().unwrap_or(0),
+            _ => {}
+        }
+    }
+    Ok(KillReport {
+        result: result.ok_or("kill output did not include a result")?,
+        pid,
+        mode,
+        pidfile_present: present,
+        clear_fails,
+    })
 }
 
 async fn start_test(
@@ -933,6 +1135,27 @@ mod tests {
         assert_eq!(status.pidfile, Some(123));
         assert_eq!(status.script, "kitt.sh");
         assert!(status.summary().contains("running kitt.sh"));
+    }
+
+    #[test]
+    fn parses_kill_results() {
+        let termed =
+            parse_kill("RESULT=termed\nPID=42\nMODE=1\nPRESENT=0\nPIDFILE=\nCLEAR_FAILS=0\n")
+                .unwrap();
+        assert_eq!(termed.pid, Some(42));
+        assert_eq!(termed.mode.as_deref(), Some("1"));
+        assert!(!termed.pidfile_present);
+        assert!(termed.summary().contains("stopped PID 42 with TERM"));
+        assert!(termed.summary().contains("led_mode=1"));
+        let unrelated =
+            parse_kill("RESULT=unrelated\nPID=43\nMODE=1\nPRESENT=0\nPIDFILE=\nCLEAR_FAILS=0\n")
+                .unwrap();
+        assert!(unrelated.summary().contains("was not signalled"));
+        let failed =
+            parse_kill("RESULT=termed\nPID=44\nMODE=0\nPRESENT=1\nPIDFILE=44\nCLEAR_FAILS=3\n")
+                .unwrap();
+        assert_eq!(failed.clear_fails, 3);
+        assert!(failed.pidfile_present);
     }
 
     #[test]
