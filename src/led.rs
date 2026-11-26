@@ -81,6 +81,55 @@ impl Leds {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LedLine {
+    Color {
+        port: usize,
+        channel: Channel,
+        value: u16,
+    },
+    Mode(u8),
+}
+
+pub fn parse_line(line: &str) -> Option<LedLine> {
+    let line = line.trim_end_matches('\r');
+    let fields: Vec<&str> = line.split_whitespace().collect();
+    if fields.len() == 2 && fields[0] == "mode" {
+        let value = fields[1].parse::<u8>().ok()?;
+        return (value <= 1).then_some(LedLine::Mode(value));
+    }
+    if fields.len() != 3 {
+        return None;
+    }
+    let port = fields[0].parse::<usize>().ok()?;
+    if !(1..=PORT_COUNT).contains(&port) {
+        return None;
+    }
+    let channel = Channel::from_token(fields[1])?;
+    let value = fields[2].parse::<u16>().ok()?;
+    Some(LedLine::Color {
+        port,
+        channel,
+        value,
+    })
+}
+
+impl Leds {
+    pub fn apply_line(&mut self, line: &str) -> Option<LedLine> {
+        match parse_line(line)? {
+            parsed @ LedLine::Color {
+                port,
+                channel,
+                value,
+            } => {
+                self.set(port, channel, value);
+                Some(parsed)
+            }
+            parsed @ LedLine::Mode(_) => Some(parsed),
+        }
+    }
+}
+
 pub fn to_u8(value: u16) -> u8 {
     (value as u32 * 255 / 65535) as u8
 }
@@ -114,5 +163,76 @@ mod tests {
         assert_eq!(to_u8(65535), 255);
         assert_eq!(to_u8(10280), 40);
         assert_eq!(to_u8(0), 0);
+    }
+
+    #[test]
+    fn parses_color_writes() {
+        assert_eq!(
+            parse_line("7 g 65535"),
+            Some(LedLine::Color {
+                port: 7,
+                channel: Channel::Green,
+                value: 65535,
+            })
+        );
+        assert_eq!(
+            parse_line("48 b 0\r"),
+            Some(LedLine::Color {
+                port: 48,
+                channel: Channel::Blue,
+                value: 0,
+            })
+        );
+        assert_eq!(
+            parse_line("  1   r   257  "),
+            Some(LedLine::Color {
+                port: 1,
+                channel: Channel::Red,
+                value: 257,
+            })
+        );
+    }
+
+    #[test]
+    fn parses_mode_writes() {
+        assert_eq!(parse_line("mode 0"), Some(LedLine::Mode(0)));
+        assert_eq!(parse_line("mode 1"), Some(LedLine::Mode(1)));
+        assert_eq!(parse_line("mode 2"), None);
+    }
+
+    #[test]
+    fn ignores_non_protocol_lines() {
+        for line in [
+            "",
+            "kitt: 24 columns / 48 LEDs, 22 ms/step",
+            "kitt: stopped, LEDs back under firmware control.",
+            "0 r 0",
+            "49 r 0",
+            "1 x 0",
+            "1 r 65536",
+            "1 r",
+            "1 r 0 extra",
+            "mode",
+        ] {
+            assert_eq!(parse_line(line), None, "{line:?}");
+        }
+    }
+
+    #[test]
+    fn applies_color_writes_only() {
+        let mut leds = Leds::new();
+        assert_eq!(
+            leds.apply_line("3 r 35980"),
+            Some(LedLine::Color {
+                port: 3,
+                channel: Channel::Red,
+                value: 35980,
+            })
+        );
+        assert_eq!(leds.get(3, Channel::Red), 35980);
+        leds.apply_line("mode 1");
+        assert_eq!(leds.get(3, Channel::Red), 35980);
+        leds.apply_line("not a frame");
+        assert_eq!(leds.get(3, Channel::Red), 35980);
     }
 }
