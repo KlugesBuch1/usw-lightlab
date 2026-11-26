@@ -3,6 +3,7 @@
 mod action;
 mod app;
 mod hostkeys;
+mod instance;
 mod led;
 mod preview;
 mod remote;
@@ -13,6 +14,14 @@ mod strip;
 use eframe::egui;
 
 fn main() -> eframe::Result<()> {
+    let _instance = match instance::acquire("LightLab") {
+        Ok(Some(instance)) => instance,
+        Ok(None) => return Ok(()),
+        Err(error) => {
+            instance::show_error(&error);
+            return Ok(());
+        }
+    };
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([1000.0, 820.0])
