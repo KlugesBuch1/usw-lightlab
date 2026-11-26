@@ -408,7 +408,10 @@ mod tests {
 
     #[test]
     fn resolves_a_real_file() {
-        let path = std::env::current_dir().unwrap().join("kitt.sh");
+        let path = std::env::current_dir()
+            .unwrap()
+            .join("animations")
+            .join("kitt.sh");
         let mapped = to_wsl_path(&path).unwrap();
         assert!(mapped.starts_with("/mnt/"), "{mapped}");
         assert!(mapped.ends_with("/kitt.sh"), "{mapped}");

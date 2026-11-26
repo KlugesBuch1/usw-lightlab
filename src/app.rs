@@ -1162,7 +1162,7 @@ fn section_label(text: &str) -> RichText {
 fn default_script() -> String {
     std::env::current_dir()
         .ok()
-        .map(|dir| dir.join("kitt.sh"))
+        .map(|dir| dir.join("animations").join("kitt.sh"))
         .filter(|path| path.is_file())
         .map(|path| path.to_string_lossy().to_string())
         .unwrap_or_default()
