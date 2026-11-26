@@ -279,7 +279,7 @@ impl Remote {
                     Ok(runtime) => runtime,
                     Err(error) => {
                         sink.emit(RemoteEvent::Error(format!(
-                            "cannot start the SSH worker: {error}"
+                            "cannot start the SSH worker: {error}. No remote command ran; switch state unknown."
                         )));
                         return;
                     }
@@ -374,7 +374,7 @@ async fn run(mut commands: tokio_mpsc::UnboundedReceiver<Command>, sink: Sink) {
                             sink.emit(RemoteEvent::Log("closing test stdin; waiting for the switch to restore LEDs".into()));
                         } else {
                             sink.emit(RemoteEvent::Error(
-                                "no test is attached to stop; no remote command ran".into(),
+                                "no test is attached to stop; no remote command ran; led_mode and the pidfile were not changed".into(),
                             ));
                         }
                     }
@@ -423,7 +423,7 @@ async fn connect(settings: Settings, session: &mut Option<Handle<Handler>>, sink
         Ok(path) => path,
         Err(error) => {
             sink.emit(RemoteEvent::Error(format!(
-                "cannot find the pinned host key file: {error}"
+                "cannot find the pinned host key file: {error}. No remote command ran; led_mode and the pidfile were not changed."
             )));
             return;
         }
@@ -544,7 +544,7 @@ async fn keep(
             }
             Err(error) => {
                 sink.emit(RemoteEvent::Error(format!(
-                    "the kept run was launched but its state could not be read: {error}. Check /tmp/usw-lightlab.log and the pidfile."
+                    "the kept run was launched but its state could not be read: {error}. led_mode and the pidfile are unknown; check /tmp/usw-lightlab.log."
                 )));
                 return;
             }
@@ -724,7 +724,7 @@ async fn start_test(
     };
     if status.is_running() {
         sink.emit(RemoteEvent::Error(format!(
-            "a run is already live: PID {} with script {}. Stop it with Kill before testing. Nothing changed; {}.",
+            "a run is already live: PID {} with script {}. Stop it before testing. Nothing changed; {}.",
             status.pidfile.unwrap_or_default(),
             status.script,
             status.summary()

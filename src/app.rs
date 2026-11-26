@@ -187,7 +187,15 @@ impl LightLab {
                     self.test_active = None;
                     self.action.finish();
                     if let Some(error) = error {
-                        self.push_error(error);
+                        let state = self
+                            .run_status
+                            .as_ref()
+                            .map(|status| status.summary())
+                            .unwrap_or_else(|| {
+                                "switch state unknown; reconnect to inspect led_mode and the pidfile"
+                                    .to_string()
+                            });
+                        self.push_error(format!("{error}. {state}."));
                     } else if stopped {
                         match code {
                             Some(code) => self.push_log(format!(
@@ -301,7 +309,9 @@ impl LightLab {
             }
             if let Err(error) = self.remote.disconnect() {
                 self.action.finish();
-                self.push_error(format!("cannot disconnect: {error}"));
+                self.push_error(format!(
+                    "cannot disconnect: {error}. No remote command ran; led_mode and the pidfile were not changed."
+                ));
             }
             return;
         }
@@ -419,7 +429,9 @@ impl LightLab {
         }
         if let Err(error) = self.remote.stop_test() {
             self.action.finish();
-            self.push_error(format!("cannot stop the test: {error}"));
+            self.push_error(format!(
+                "cannot stop the test: {error}. No remote command ran; led_mode and the pidfile were not changed."
+            ));
         }
     }
 
@@ -487,7 +499,9 @@ impl LightLab {
     fn start_preview(&mut self) {
         self.error = None;
         if self.config.script_path.trim().is_empty() {
-            self.push_error("Cannot preview: no animation script selected.");
+            self.push_error(
+                "Cannot preview: no animation script selected. Switch state was not touched by the local preview.",
+            );
             return;
         }
         let path = self.config.script_path.trim().to_string();
@@ -500,7 +514,9 @@ impl LightLab {
                     .unwrap_or(path);
                 self.push_log(format!("starting preview of {name}"));
             }
-            Err(error) => self.push_error(error),
+            Err(error) => self.push_error(format!(
+                "{error}. Switch state was not touched by the local preview."
+            )),
         }
     }
 
@@ -514,11 +530,12 @@ impl LightLab {
             .unwrap_or_else(|_| "%APPDATA%\\lightlab\\known_hosts".into());
         egui::Window::new("Verify switch host key")
             .anchor(Align2::CENTER_CENTER, [0.0, 0.0])
+            .fixed_size(egui::vec2(540.0, 320.0))
             .collapsible(false)
             .resizable(false)
             .movable(false)
             .show(ctx, |ui| {
-                ui.set_min_width(460.0);
+                ui.set_min_width(500.0);
                 ui.label(
                     RichText::new(format!("First connection to {}:{}", prompt.host, prompt.port))
                         .size(15.0)
@@ -559,14 +576,18 @@ impl LightLab {
                         .color(Color32::from_rgb(112, 120, 132)),
                 );
                 ui.add_space(12.0);
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if ui.button("Trust and connect").clicked() {
-                        decision = Some(true);
-                    }
-                    if ui.button("Cancel").clicked() {
-                        decision = Some(false);
-                    }
-                });
+                ui.allocate_ui_with_layout(
+                    egui::vec2(ui.available_width(), 32.0),
+                    egui::Layout::right_to_left(egui::Align::Center),
+                    |ui| {
+                        if ui.button("Trust and connect").clicked() {
+                            decision = Some(true);
+                        }
+                        if ui.button("Cancel").clicked() {
+                            decision = Some(false);
+                        }
+                    },
+                );
             });
         if let Some(accept) = decision {
             let prompt = self.host_prompt.take().unwrap();
